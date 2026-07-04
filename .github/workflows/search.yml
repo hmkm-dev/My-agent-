@@ -1,1 +1,78 @@
+name: Qwoted Search
 
+# Triggered by the Cloudflare Worker via repository_dispatch when someone
+# sends /search <topic> in Telegram. Also runs on a daily schedule as a
+# baseline sweep even without a manual trigger.
+on:
+  repository_dispatch:
+    types: [qwoted_search]
+  schedule:
+    - cron: "0 6 * * *"   # daily 06:00 UTC baseline search
+  workflow_dispatch:        # manual "Run workflow" button in GitHub UI
+    inputs:
+      query:
+        description: "Search query"
+        required: false
+        default: ""
+
+jobs:
+  search:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+      CF_D1_DATABASE_ID: ${{ secrets.CF_D1_DATABASE_ID }}
+      CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+      WORKER_URL: ${{ secrets.WORKER_URL }}
+      NOTIFY_SECRET: ${{ secrets.NOTIFY_SECRET }}
+      QWOTED_HOME: ${{ github.workspace }}/.qwoted-state
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Pull state from D1
+        run: python3 d1_client.py pull
+
+      - name: Determine query
+        id: q
+        run: |
+          QUERY="${{ github.event.client_payload.query }}"
+          if [ -z "$QUERY" ]; then
+            QUERY="${{ github.event.inputs.query }}"
+          fi
+          if [ -z "$QUERY" ]; then
+            QUERY="SaaS growth marketing"   # baseline scheduled query — edit as needed
+          fi
+          echo "query=$QUERY" >> "$GITHUB_OUTPUT"
+
+      - name: Run search
+        id: run_search
+        run: |
+          set -e
+          python3 qwoted_search.py --query "${{ steps.q.outputs.query }}" --max-hits 30 \
+            | tee search_output.log
+        continue-on-error: true
+
+      - name: Push results to D1
+        if: always()
+        run: python3 d1_client.py push
+
+      - name: Notify Telegram (via Worker)
+        if: always()
+        run: |
+          COUNT=$(grep -oE '"count": [0-9]+' search_output.log | tail -1 | grep -oE '[0-9]+' || echo "0")
+          if [ "${{ steps.run_search.outcome }}" = "failure" ]; then
+            MSG="⚠️ Search for \"${{ steps.q.outputs.query }}\" failed. Check GitHub Actions logs — session may need re-login."
+          else
+            MSG="🔍 Search complete: \"${{ steps.q.outputs.query }}\" → ${COUNT} opportunities found and synced to D1."
+          fi
+          curl -sS -X POST "$WORKER_URL/api/notify" \
+            -H "Authorization: Bearer $NOTIFY_SECRET" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -n --arg m "$MSG" --arg t "search_run" '{event_type:$t, message:$m}')" || true

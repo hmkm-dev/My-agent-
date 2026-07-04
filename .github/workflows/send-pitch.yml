@@ -1,0 +1,56 @@
+name: Qwoted Send Pitch
+
+# Triggered ONLY by the Worker, ONLY after you tap "Approve" (or send
+# /approve <id>) in Telegram. This is the single place in the whole system
+# that actually POSTs a pitch to a real journalist on Qwoted — treat it
+# with respect.
+on:
+  repository_dispatch:
+    types: [qwoted_send_pitch]
+
+jobs:
+  send:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+      CF_D1_DATABASE_ID: ${{ secrets.CF_D1_DATABASE_ID }}
+      CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+      WORKER_URL: ${{ secrets.WORKER_URL }}
+      NOTIFY_SECRET: ${{ secrets.NOTIFY_SECRET }}
+      QWOTED_HOME: ${{ github.workspace }}/.qwoted-state
+      PITCH_ID: ${{ github.event.client_payload.pitch_id }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Pull state from D1
+        run: python3 d1_client.py pull
+
+      - name: Fetch approved pitch details from D1 and send
+        id: send
+        run: python3 send_approved_pitch.py --pitch-id "$PITCH_ID"
+        continue-on-error: true
+
+      - name: Push results to D1
+        if: always()
+        run: python3 d1_client.py push
+
+      - name: Notify Telegram of outcome
+        if: always()
+        run: |
+          if [ "${{ steps.send.outcome }}" = "success" ]; then
+            MSG="✅ Pitch #$PITCH_ID sent successfully to the journalist on Qwoted."
+          else
+            MSG="🔴 Pitch #$PITCH_ID FAILED to send. Check GitHub Actions logs — session may need re-login (see README_DEPLOY.md Phase 1)."
+          fi
+          curl -sS -X POST "$WORKER_URL/api/notify" \
+            -H "Authorization: Bearer $NOTIFY_SECRET" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -n --arg m "$MSG" --arg t "pitch_sent" '{event_type:$t, message:$m}')" || true

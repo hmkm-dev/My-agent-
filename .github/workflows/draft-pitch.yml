@@ -1,0 +1,49 @@
+name: Qwoted Draft Pitches
+
+# Runs after fresh opportunities exist in D1. Picks the best-scoring "new"
+# opportunities, asks GLM to write a Direct-Response pitch for each, saves
+# it to D1 as pending_approval, and asks the Worker to ping Telegram with
+# Approve/Reject buttons. NOTHING is sent to Qwoted from this workflow —
+# that only happens from send-pitch.yml, after explicit human approval.
+on:
+  schedule:
+    - cron: "30 6 * * *"   # 30 min after the daily search sweep
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: "Max opportunities to draft this run"
+        required: false
+        default: "5"
+
+jobs:
+  draft:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+      CF_D1_DATABASE_ID: ${{ secrets.CF_D1_DATABASE_ID }}
+      CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+      GLM_API_KEY: ${{ secrets.GLM_API_KEY }}
+      GLM_MODEL: ${{ secrets.GLM_MODEL }}   # optional — leave secret unset to use default (glm-4-plus)
+      WORKER_URL: ${{ secrets.WORKER_URL }}
+      NOTIFY_SECRET: ${{ secrets.NOTIFY_SECRET }}
+      QWOTED_HOME: ${{ github.workspace }}/.qwoted-state
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Pull state from D1
+        run: python3 d1_client.py pull
+
+      - name: Generate drafts with GLM
+        run: |
+          python3 glm_pitch_writer.py \
+            --limit "${{ github.event.inputs.limit || '5' }}" \
+            --worker-url "$WORKER_URL" \
+            --notify-secret "$NOTIFY_SECRET"
