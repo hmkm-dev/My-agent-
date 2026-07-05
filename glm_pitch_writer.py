@@ -54,6 +54,27 @@ requesting inclusion in a media story. Style rules (non-negotiable):
 """
 
 
+def fetch_learning_examples() -> dict:
+    """Pull recent human feedback so the model learns this user's taste over
+    time: pitches that got sent (implicitly approved) as GOOD examples, and
+    rejected ones (with any reason the human gave) as things to avoid."""
+    good = d1_query(
+        "SELECT pitch_text FROM pitches WHERE status = 'sent' "
+        "ORDER BY id DESC LIMIT 3"
+    )
+    bad = d1_query(
+        "SELECT pitch_text, feedback_note FROM pitches WHERE status = 'rejected' "
+        "ORDER BY id DESC LIMIT 3"
+    )
+    return {
+        "good": [r["pitch_text"] for r in good if r.get("pitch_text")],
+        "bad": [
+            {"text": r["pitch_text"], "reason": r.get("feedback_note") or ""}
+            for r in bad if r.get("pitch_text")
+        ],
+    }
+
+
 def _spammy_filters_pass(opp: dict) -> tuple[bool, str]:
     """Strict quality gate. Returns (passes, reason_if_rejected)."""
     if not opp.get("want_pitches", True) and opp.get("want_pitches") is not None:
@@ -96,15 +117,28 @@ def fetch_candidates(limit: int) -> list[dict]:
     return candidates
 
 
-def call_glm(opportunity: dict) -> str:
+def call_glm(opportunity: dict, learning: dict | None = None) -> str:
     if not GLM_API_KEY:
         raise RuntimeError("GLM_API_KEY not set")
+
+    learning_block = ""
+    if learning:
+        if learning.get("good"):
+            learning_block += "\n\nHere are pitches this specific user has previously APPROVED and sent — match this style, tone, and structure as closely as fits the new request:\n"
+            for i, txt in enumerate(learning["good"][:3], 1):
+                learning_block += f"\n[Approved example {i}]\n{txt[:600]}\n"
+        if learning.get("bad"):
+            learning_block += "\n\nHere are pitches this user REJECTED. Avoid repeating whatever made these weak (if a reason was given, it's included):\n"
+            for i, item in enumerate(learning["bad"][:3], 1):
+                reason = f" (Reason for rejection: {item['reason']})" if item.get("reason") else ""
+                learning_block += f"\n[Rejected example {i}]{reason}\n{item['text'][:400]}\n"
 
     user_prompt = (
         f"Journalist request: {opportunity.get('name', '')}\n\n"
         f"Details: {opportunity.get('details', '')}\n\n"
         f"Request type: {opportunity.get('request_type', '')} / "
-        f"{opportunity.get('request_sub_type', '')}\n\n"
+        f"{opportunity.get('request_sub_type', '')}\n"
+        f"{learning_block}\n\n"
         "Write the pitch body now."
     )
 
@@ -159,11 +193,14 @@ def main() -> None:
     candidates = fetch_candidates(args.limit)
     _log(f"{len(candidates)} candidates passed quality filters")
 
+    learning = fetch_learning_examples()
+    _log(f"learning context: {len(learning['good'])} approved examples, {len(learning['bad'])} rejected examples")
+
     drafted = 0
     for opp in candidates:
         sr_id = opp.get("source_request_id")
         try:
-            pitch_text = call_glm(opp)
+            pitch_text = call_glm(opp, learning)
         except Exception as e:
             _log(f"ERROR: GLM draft failed for SR {sr_id}: {e}")
             _log_event("error", f"GLM draft failed SR {sr_id}: {e}")
@@ -217,3 +254,4 @@ if __name__ == "__main__":
         _log(f"FATAL: {e}")
         _log_event("error", str(e))
         sys.exit(1)
+  
